@@ -1030,9 +1030,11 @@ impl BrowserManager {
         self.client
             .send_command_no_params("Page.enable", Some(session_id))
             .await?;
-        self.client
-            .send_command_no_params("Runtime.enable", Some(session_id))
-            .await?;
+        if super::noruntime::runtime_enable_wanted() {
+            self.client
+                .send_command_no_params("Runtime.enable", Some(session_id))
+                .await?;
+        }
         self.client
             .send_command_no_params("Network.enable", Some(session_id))
             .await?;
@@ -1303,9 +1305,11 @@ impl BrowserManager {
         self.client
             .send_command_no_params("Page.enable", None)
             .await?;
-        self.client
-            .send_command_no_params("Runtime.enable", None)
-            .await?;
+        if super::noruntime::runtime_enable_wanted() {
+            self.client
+                .send_command_no_params("Runtime.enable", None)
+                .await?;
+        }
         let _ = self
             .client
             .send_command_no_params("Runtime.runIfWaitingForDebugger", None)
@@ -3962,24 +3966,24 @@ mod tests {
         false,
         true
     );
-    failed_initialization_test!(
-        test_failed_direct_runtime_disconnects,
-        "Runtime.enable",
-        true,
-        false
-    );
-    failed_initialization_test!(
-        test_failed_new_page_runtime_disconnects,
-        "Runtime.enable",
-        false,
-        false
-    );
-    failed_initialization_test!(
-        test_failed_existing_page_runtime_disconnects,
-        "Runtime.enable",
-        false,
-        true
-    );
+    // Fork patch: Runtime.enable is only sent with AGENT_BROWSER_CAPTURE_CONSOLE=1.
+    #[tokio::test]
+    async fn test_runtime_enable_only_sent_when_capturing_console() {
+        for (direct, existing) in [(true, false), (false, false), (false, true)] {
+            let (url, server) = initialization_server("Unused.method", existing, 1, false).await;
+            let mut manager = BrowserManager::connect_cdp_inner(&url, direct, None)
+                .await
+                .unwrap();
+            manager.close().await.unwrap();
+            let methods = server.await.unwrap().remove(0);
+            assert!(methods.iter().any(|m| m == "Page.enable"), "{methods:?}");
+            assert_eq!(
+                methods.iter().any(|m| m == "Runtime.enable"),
+                crate::native::noruntime::runtime_enable_wanted(),
+                "{methods:?}"
+            );
+        }
+    }
     failed_initialization_test!(
         test_failed_direct_network_disconnects,
         "Network.enable",
@@ -4111,7 +4115,6 @@ mod tests {
             "Target.createTarget",
             "Target.attachToTarget",
             "Page.enable",
-            "Runtime.enable",
             "Network.enable",
         ] {
             let (url, server) = initialization_server(method, false, 2, false).await;

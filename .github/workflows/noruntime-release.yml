@@ -1,0 +1,218 @@
+# Fork-only workflow (see PATCHED.md): test and build the noruntime patch for
+# Linux x64 the way upstream's release.yml builds agent-browser-linux-x64, and
+# attach the binary to a GitHub release.
+name: Patched release (noruntime)
+
+on:
+  push:
+    tags:
+      - "v*-noruntime.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create or update, e.g. v0.41.1-noruntime.1. Empty: build and test only."
+        required: false
+        default: ""
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.tag }}
+
+permissions:
+  contents: read
+
+env:
+  BINARY: agent-browser-linux-x64
+  RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+
+jobs:
+  test:
+    name: Patch guard and Rust tests (touched modules)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Every Runtime.enable send is gated
+        # Fails when upstream adds a new Runtime.enable call site; gate it with
+        # noruntime::runtime_enable_wanted() like the others. state.rs enables
+        # Runtime on its own throwaway blank tab (state save), which is fine.
+        run: |
+          python3 - <<'EOF'
+          import pathlib, re, sys
+          bad = []
+          for path in sorted(pathlib.Path("cli/src").rglob("*.rs")):
+              if path.as_posix() == "cli/src/native/state.rs":
+                  continue
+              lines = path.read_text().splitlines()
+              for i, line in enumerate(lines):
+                  if '"Runtime.enable"' not in line:
+                      continue
+                  call = " ".join(lines[max(0, i - 2):i + 1])
+                  if not re.search(r'send_command\w*\(\s*"Runtime\.enable"', call):
+                      continue  # a string in a test, not a send
+                  if "runtime_enable_wanted()" not in " ".join(lines[max(0, i - 4):i]):
+                      bad.append(f"{path}:{i + 1}: {line.strip()}")
+          if bad:
+              print("Ungated Runtime.enable sends:\n" + "\n".join(bad))
+              sys.exit(1)
+          print("all Runtime.enable sends are gated")
+          EOF
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+          key: noruntime-test
+
+      - name: Format check
+        run: cargo fmt --manifest-path cli/Cargo.toml -- --check
+
+      - name: Run Rust tests (noruntime, browser, actions)
+        run: >-
+          cargo test --profile ci --manifest-path cli/Cargo.toml --bin agent-browser --
+          native::noruntime:: native::browser:: native::actions::
+
+  build:
+    name: Build agent-browser-linux-x64
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      base: ${{ steps.version.outputs.base }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Install npm dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Sync version
+        run: pnpm run version:sync
+
+      - name: Set patched version
+        id: version
+        # The binary reports <base>-noruntime.<n>, so `--version` shows the
+        # patch and a CLI swap restarts daemons left by the stock binary.
+        run: |
+          set -euo pipefail
+          base=$(node -p "require('./package.json').version")
+          if [ -n "$RELEASE_TAG" ]; then
+            case "$RELEASE_TAG" in
+              "v$base-noruntime."[0-9]*) version="${RELEASE_TAG#v}" ;;
+              *) echo "::error::tag $RELEASE_TAG must be v$base-noruntime.<n> (package.json is $base)"; exit 1 ;;
+            esac
+          else
+            version="$base-noruntime.0"
+          fi
+          sed -i "0,/^version = \".*\"/s//version = \"$version\"/" cli/Cargo.toml
+          grep -m1 '^version = ' cli/Cargo.toml
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Build dashboard
+        run: pnpm --filter dashboard build
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install cargo-zigbuild
+        run: |
+          pip3 install ziglang
+          cargo install cargo-zigbuild --version 0.23.2 --locked
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+          key: noruntime-zigbuild
+
+      - name: Build with zigbuild (glibc 2.28 floor, as upstream)
+        run: cargo zigbuild --release --manifest-path cli/Cargo.toml --target x86_64-unknown-linux-gnu.2.28
+
+      - name: Copy binary
+        run: |
+          mkdir -p artifacts
+          cp cli/target/x86_64-unknown-linux-gnu/release/agent-browser "artifacts/$BINARY"
+          chmod +x "artifacts/$BINARY"
+
+      - name: Verify Linux GNU glibc floor
+        run: |
+          set -euo pipefail
+          if objdump -p "artifacts/$BINARY" | grep -E 'GLIBC_2\.([3-9][0-9]|29)'; then
+            echo "ERROR: $BINARY requires glibc newer than 2.28"
+            exit 1
+          fi
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          out=$("artifacts/$BINARY" --version)
+          echo "$out"
+          [ "$out" = "agent-browser ${{ steps.version.outputs.version }}" ]
+          grep -q AGENT_BROWSER_CAPTURE_CONSOLE "artifacts/$BINARY"
+          if grep -q 'Dashboard not built' "artifacts/$BINARY"; then
+            echo "ERROR: dashboard placeholder embedded"; exit 1
+          fi
+          (cd artifacts && sha256sum "$BINARY" > "$BINARY.sha256" && cat "$BINARY.sha256")
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY }}
+          path: artifacts/
+          retention-days: 14
+
+  release:
+    name: GitHub release
+    needs: [test, build]
+    if: github.event_name == 'push' || inputs.tag != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BINARY }}
+          path: artifacts
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE: ${{ needs.build.outputs.base }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          agent-browser $BASE (upstream tag \`v$BASE\`) with the noruntime patch: CDP \`Runtime.enable\` is not sent unless \`AGENT_BROWSER_CAPTURE_CONSOLE=1\` is set when the daemon starts, so pages can't see the Runtime.enable leak. \`console\` and \`errors\` stay empty without that variable.
+
+          Built from ${{ github.sha }}. Only \`$BINARY\` (glibc 2.28+) is built. Install with \`scripts/install-patched.sh $RELEASE_TAG\` (see PATCHED.md).
+
+          \`\`\`
+          $(cat "artifacts/$BINARY.sha256")
+          \`\`\`
+          EOF
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+              "artifacts/$BINARY" "artifacts/$BINARY.sha256"
+          else
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "$RELEASE_TAG" --notes-file notes.md \
+              "artifacts/$BINARY" "artifacts/$BINARY.sha256"
+          fi
