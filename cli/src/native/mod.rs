@@ -55,3 +55,6 @@ pub mod webmcp;
 mod e2e_tests;
 #[cfg(test)]
 mod parity_tests;
+
+// Fork patch (PATCHED.md): Runtime.enable is opt-in.
+pub(crate) mod noruntime;

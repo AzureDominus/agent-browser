@@ -3927,9 +3927,11 @@ async fn prepare_auto_attached_session(client: &CdpClient, session_id: &str) -> 
     client
         .send_command_no_params("Page.enable", Some(session_id))
         .await?;
-    client
-        .send_command_no_params("Runtime.enable", Some(session_id))
-        .await?;
+    if super::noruntime::runtime_enable_wanted() {
+        client
+            .send_command_no_params("Runtime.enable", Some(session_id))
+            .await?;
+    }
     client
         .send_command_no_params("Network.enable", Some(session_id))
         .await?;
